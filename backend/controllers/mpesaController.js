@@ -1,57 +1,112 @@
 const axios = require("axios");
 const moment = require("moment");
-const { CONSUMER_KEY, CONSUMER_SECRET, SHORTCODE, PASSKEY, CALLBACK_URL } = require("../config/mpesaConfig");
+const Transaction = require("../models/Transaction"); // Import Model
+require("dotenv").config();
 
-// Function to get M-Pesa access token
-const getAccessToken = async () => {
-  const auth = Buffer.from(`${CONSUMER_KEY}:${CONSUMER_SECRET}`).toString("base64");
+const {
+  DARAJA_CONSUMER_KEY,
+  DARAJA_CONSUMER_SECRET,
+  MPESA_SHORTCODE,
+  MPESA_PASSKEY,
+  MPESA_CALLBACK_URL,
+} = process.env;
+
+// Get OAuth Token
+const getOAuthToken = async () => {
   try {
-    const response = await axios.get("https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials", {
-      headers: { Authorization: `Basic ${auth}` },
-    });
-    return response.data.access_token;
+    const auth = Buffer.from(`${DARAJA_CONSUMER_KEY}:${DARAJA_CONSUMER_SECRET}`).toString("base64");
+    const { data } = await axios.get(
+      "https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials",
+      { headers: { Authorization: `Basic ${auth}` } }
+    );
+    
+    if (!data.access_token) throw new Error("Failed to retrieve access token");
+    return data.access_token;
   } catch (error) {
-    console.error("M-Pesa Token Error:", error.response.data);
-    throw new Error("Failed to get access token");
+    console.error("❌ OAuth Token Error:", error.response ? error.response.data : error.message);
+    throw new Error("Failed to get OAuth token");
   }
 };
 
-// Function to trigger STK Push
+// STK Push Function
 const stkPush = async (req, res) => {
-  const { phone, amount } = req.body;
-  const timestamp = moment().format("YYYYMMDDHHmmss");
-  const password = Buffer.from(`${SHORTCODE}${PASSKEY}${timestamp}`).toString("base64");
+  const { phoneNumber, amount } = req.body;
+
+  if (!phoneNumber || !amount) {
+    return res.status(400).json({ error: "Phone number and amount are required" });
+  }
 
   try {
-    const accessToken = await getAccessToken();
+    const access_token = await getOAuthToken();
+    const timestamp = moment().format("YYYYMMDDHHmmss");
+    const password = Buffer.from(`${MPESA_SHORTCODE}${MPESA_PASSKEY}${timestamp}`).toString("base64");
 
-    const response = await axios.post("https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest", {
-      BusinessShortCode: SHORTCODE,
+    const requestData = {
+      BusinessShortCode: MPESA_SHORTCODE,
       Password: password,
       Timestamp: timestamp,
       TransactionType: "CustomerPayBillOnline",
       Amount: amount,
-      PartyA: phone,
-      PartyB: SHORTCODE,
-      PhoneNumber: phone,
-      CallBackURL: CALLBACK_URL,
-      AccountReference: "BingwaData",
-      TransactionDesc: "Buy Data",
-    }, {
-      headers: { Authorization: `Bearer ${accessToken}` },
-    });
+      PartyA: phoneNumber,
+      PartyB: MPESA_SHORTCODE,
+      PhoneNumber: phoneNumber,
+      CallBackURL: MPESA_CALLBACK_URL,
+      AccountReference: "Bingwa Data",
+      TransactionDesc: "Data Purchase",
+    };
 
-    res.json(response.data);
+    const { data } = await axios.post(
+      "https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest",
+      requestData,
+      { headers: { Authorization: `Bearer ${access_token}` } }
+    );
+
+    if (!data.CheckoutRequestID) {
+      console.error("❌ STK Push Error Response:", data);
+      throw new Error("STK Push request failed");
+    }
+
+    // Save transaction in MongoDB
+    const transaction = new Transaction({
+      phoneNumber,
+      amount,
+      transactionId: data.CheckoutRequestID,
+      status: "Pending",
+    });
+    await transaction.save();
+
+    return res.status(200).json(data);
   } catch (error) {
-    console.error("STK Push Error:", error.response.data);
-    res.status(500).json({ message: "STK Push failed" });
+    console.error("❌ STK Push Error:", error.response ? error.response.data : error.message);
+    return res.status(500).json({ error: "STK Push Request Failed" });
   }
 };
 
-// M-Pesa Callback Function
-const mpesaCallback = async (req, res) => {
-  console.log("M-Pesa Callback Received:", req.body);
-  res.sendStatus(200);
+// Callback Function
+const callback = async (req, res) => {
+  console.log("📞 M-Pesa Callback Received:", JSON.stringify(req.body, null, 2));
+
+  if (!req.body.Body || !req.body.Body.stkCallback) {
+    return res.status(400).json({ error: "Invalid callback data" });
+  }
+
+  const { CheckoutRequestID, ResultCode, ResultDesc } = req.body.Body.stkCallback;
+
+  try {
+    const transaction = await Transaction.findOne({ transactionId: CheckoutRequestID });
+    if (!transaction) {
+      return res.status(404).json({ error: "Transaction not found" });
+    }
+
+    transaction.status = ResultCode === 0 ? "Completed" : "Failed";
+    transaction.resultDesc = ResultDesc;
+    await transaction.save();
+
+    return res.status(200).json({ message: "Transaction updated", status: transaction.status });
+  } catch (error) {
+    console.error("❌ Error updating transaction:", error.message);
+    return res.status(500).json({ error: "Failed to update transaction" });
+  }
 };
 
-module.exports = { stkPush, mpesaCallback };
+module.exports = { stkPush, callback };
